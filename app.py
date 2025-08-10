@@ -1,102 +1,108 @@
-from flask import Flask, render_template_string, request, redirect, url_for
-import sqlite3
-import stripe
-import requests
 import os
+import sqlite3
+import requests
+from flask import Flask, request, jsonify, redirect, url_for
+import stripe
 
 app = Flask(__name__)
 
-# إعداد Stripe
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_yourkey")
-PUBLIC_KEY = os.getenv("STRIPE_PUBLIC_KEY", "pk_test_yourkey")
+# Stripe keys (ضع مفاتيحك هنا أو في Environment Variables)
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "ضع_مفتاحك_السري")
+STRIPE_PUBLIC_KEY = os.getenv("STRIPE_PUBLIC_KEY", "ضع_المفتاح_العام")
 
-# إنشاء قاعدة البيانات إذا لم تكن موجودة
+# قاعدة بيانات SQLite
+DB_FILE = "database.db"
+
 def init_db():
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS plans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    price REAL,
-                    currency TEXT,
-                    requests_limit INTEGER
-                )''')
-    # خطة افتراضية
-    c.execute("INSERT INTO plans (name, price, currency, requests_limit) VALUES (?, ?, ?, ?)", 
-              ("Basic Plan", 5.0, "usd", 100))
+    c.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, price REAL DEFAULT 5.0, limit_per_day INTEGER DEFAULT 100)")
+    c.execute("SELECT COUNT(*) FROM settings")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO settings (price, limit_per_day) VALUES (?, ?)", (5.0, 100))
     conn.commit()
     conn.close()
 
-@app.route('/')
+init_db()
+
+# API مجاني لجلب سعر العملات
+def get_currency_rate(base="USD", target="EUR"):
+    url = f"https://api.exchangerate-api.com/v4/latest/{base}"
+    r = requests.get(url)
+    data = r.json()
+    return data.get("rates", {}).get(target, None)
+
+@app.route("/")
 def index():
-    # جلب سعر العملة من API مجاني
-    try:
-        data = requests.get("https://api.exchangerate-api.com/v4/latest/USD").json()
-        rate = data['rates'].get("EGP", None)
-    except:
-        rate = None
-
-    # جلب الخطط من قاعدة البيانات
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT * FROM plans")
-    plans = c.fetchall()
+    c.execute("SELECT price, limit_per_day FROM settings LIMIT 1")
+    price, limit_per_day = c.fetchone()
+    conn.close()
+    return f"<h1>خدمة أسعار العملات</h1><p>الخطة الحالية: {limit_per_day} طلب يومياً</p><form action='/create-checkout-session' method='POST'><button type='submit'>ترقية الخطة بـ {price}$</button></form>"
+
+@app.route("/create-checkout-session", methods=["POST"])
+def create_checkout_session():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT price FROM settings LIMIT 1")
+    price, = c.fetchone()
     conn.close()
 
-    html = '''
-    <h1>خطط الاشتراك</h1>
-    {% for p in plans %}
-        <div style="border:1px solid #ccc; padding:10px; margin:10px;">
-            <h3>{{p[1]}}</h3>
-            <p>السعر: {{p[2]}} {{p[3]}}</p>
-            {% if rate %}<p>بالجنيه: {{ "%.2f"|format(p[2]*rate) }} EGP</p>{% endif %}
-            <form action="/checkout/{{p[0]}}" method="POST">
-                <button type="submit">اشترك الآن</button>
-            </form>
-        </div>
-    {% endfor %}
-    '''
-    return render_template_string(html, plans=plans, rate=rate)
-
-@app.route('/checkout/<int:plan_id>', methods=['POST'])
-def checkout(plan_id):
-    conn = sqlite3.connect('database.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM plans WHERE id=?", (plan_id,))
-    plan = c.fetchone()
-    conn.close()
-
-    if not plan:
-        return "Plan not found", 404
-
-    # إنشاء جلسة دفع Stripe
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{
             'price_data': {
-                'currency': plan[3],
+                'currency': 'usd',
                 'product_data': {
-                    'name': plan[1],
+                    'name': 'ترقية الخطة'
                 },
-                'unit_amount': int(plan[2] * 100),  # Stripe uses cents
+                'unit_amount': int(price * 100),
             },
             'quantity': 1,
         }],
         mode='payment',
-        success_url=request.url_root + 'success',
-        cancel_url=request.url_root + 'cancel',
+        success_url=url_for('success', _external=True),
+        cancel_url=url_for('cancel', _external=True),
     )
     return redirect(session.url, code=303)
 
-@app.route('/success')
+@app.route("/success")
 def success():
-    return "<h1>تم الدفع بنجاح ✅</h1>"
+    return "✅ تم الدفع بنجاح! خطتك تم ترقيتها."
 
-@app.route('/cancel')
+@app.route("/cancel")
 def cancel():
-    return "<h1>تم إلغاء الدفع ❌</h1>"
+    return "❌ تم إلغاء الدفع."
 
-if __name__ == '__main__':
-    if not os.path.exists('database.db'):
-        init_db()
-    app.run(debug=True, host='0.0.0.0')
+# لوحة التحكم لتعديل السعر والحد
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if request.method == "POST":
+        price = float(request.form.get("price"))
+        limit_per_day = int(request.form.get("limit_per_day"))
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE settings SET price=?, limit_per_day=? WHERE id=1", (price, limit_per_day))
+        conn.commit()
+        conn.close()
+        return "✅ تم التعديل بنجاح."
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT price, limit_per_day FROM settings LIMIT 1")
+    price, limit_per_day = c.fetchone()
+    conn.close()
+    return f"<h1>لوحة التحكم</h1><form method='POST'>السعر بالدولار: <input type='text' name='price' value='{price}'><br>الحد اليومي: <input type='text' name='limit_per_day' value='{limit_per_day}'><br><button type='submit'>حفظ</button></form>"
+
+# API لاستخدام أسعار العملات
+@app.route("/api/rate")
+def api_rate():
+    base = request.args.get("base", "USD")
+    target = request.args.get("target", "EUR")
+    rate = get_currency_rate(base, target)
+    return jsonify({"base": base, "target": target, "rate": rate})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=True, host="0.0.0.0", port=port)
